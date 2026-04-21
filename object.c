@@ -94,9 +94,70 @@ int object_exists(const ObjectID *id) {
 //
 // Returns 0 on success, -1 on error.
 int object_write(ObjectType type, const void *data, size_t len, ObjectID *id_out) {
-    // TODO: Implement
-    (void)type; (void)data; (void)len; (void)id_out;
-    return -1;
+    const char *type_str = "";
+    if (type == OBJ_BLOB) type_str = "blob";
+    else if (type == OBJ_TREE) type_str = "tree";
+    else if (type == OBJ_COMMIT) type_str = "commit";
+
+    char header[64];
+    int header_len = snprintf(header, sizeof(header), "%s %zu", type_str, len);
+
+    size_t full_len = header_len + 1 + len;
+    uint8_t *full_data = malloc(full_len);
+    if (!full_data) return -1;
+
+    memcpy(full_data, header, header_len + 1);
+    if (len > 0) memcpy(full_data + header_len + 1, data, len);
+
+    compute_hash(full_data, full_len, id_out);
+
+    if (object_exists(id_out)) {
+        free(full_data);
+        return 0; // Deduplication
+    }
+
+    char hex[HASH_HEX_SIZE + 1];
+    hash_to_hex(id_out, hex);
+
+    char dir_path[256];
+    snprintf(dir_path, sizeof(dir_path), "%s/%.2s", OBJECTS_DIR, hex);
+    mkdir(dir_path, 0755);
+
+    char tmp_path[512];
+    snprintf(tmp_path, sizeof(tmp_path), "%s/tmp_XXXXXX", dir_path);
+    int fd = mkstemp(tmp_path);
+    if (fd < 0) {
+        free(full_data);
+        return -1;
+    }
+
+    if (write(fd, full_data, full_len) != (ssize_t)full_len) {
+        close(fd);
+        unlink(tmp_path);
+        free(full_data);
+        return -1;
+    }
+
+    fsync(fd);
+    close(fd);
+    free(full_data);
+
+    char target_path[512];
+    object_path(id_out, target_path, sizeof(target_path));
+
+    if (rename(tmp_path, target_path) < 0) {
+        unlink(tmp_path);
+        return -1;
+    }
+
+    // Persist directory
+    int dir_fd = open(dir_path, O_RDONLY);
+    if (dir_fd >= 0) {
+        fsync(dir_fd);
+        close(dir_fd);
+    }
+
+    return 0;
 }
 
 // Read an object from the store.
@@ -122,7 +183,60 @@ int object_write(ObjectType type, const void *data, size_t len, ObjectID *id_out
 // The caller is responsible for calling free(*data_out).
 // Returns 0 on success, -1 on error (file not found, corrupt, etc.).
 int object_read(const ObjectID *id, ObjectType *type_out, void **data_out, size_t *len_out) {
-    // TODO: Implement
-    (void)id; (void)type_out; (void)data_out; (void)len_out;
-    return -1;
+    char target_path[512];
+    object_path(id, target_path, sizeof(target_path));
+
+    FILE *f = fopen(target_path, "rb");
+    if (!f) return -1;
+
+    fseek(f, 0, SEEK_END);
+    long file_size = ftell(f);
+    fseek(f, 0, SEEK_SET);
+
+    if (file_size < 0) { fclose(f); return -1; }
+
+    uint8_t *full_data = malloc(file_size);
+    if (!full_data) { fclose(f); return -1; }
+
+    if (fread(full_data, 1, file_size, f) != (size_t)file_size) {
+        free(full_data);
+        fclose(f);
+        return -1;
+    }
+    fclose(f);
+
+    ObjectID computed_id;
+    compute_hash(full_data, file_size, &computed_id);
+    if (memcmp(computed_id.hash, id->hash, HASH_SIZE) != 0) {
+        free(full_data);
+        return -1;
+    }
+
+    uint8_t *null_byte = memchr(full_data, '\0', file_size);
+    if (!null_byte) { free(full_data); return -1; }
+
+    uint8_t *space = memchr(full_data, ' ', null_byte - full_data);
+    if (!space) { free(full_data); return -1; }
+
+    char type_str[16] = {0};
+    size_t type_len = space - full_data;
+    if (type_len >= sizeof(type_str)) { free(full_data); return -1; }
+    memcpy(type_str, full_data, type_len);
+
+    if (strcmp(type_str, "blob") == 0) *type_out = OBJ_BLOB;
+    else if (strcmp(type_str, "tree") == 0) *type_out = OBJ_TREE;
+    else if (strcmp(type_str, "commit") == 0) *type_out = OBJ_COMMIT;
+    else { free(full_data); return -1; }
+
+    size_t data_size = file_size - (null_byte + 1 - full_data);
+    void *data = malloc(data_size);
+    if (!data) { free(full_data); return -1; }
+
+    if (data_size > 0) memcpy(data, null_byte + 1, data_size);
+    
+    *data_out = data;
+    *len_out = data_size;
+
+    free(full_data);
+    return 0;
 }
